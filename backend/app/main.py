@@ -108,9 +108,9 @@ def upload_invoice(
     project: str = Form(default=""),
     db: Session = Depends(get_db),
 ) -> dict:
-    stored_filename, original_path = save_upload_file(file)
+    stored_filename, processing_path = save_upload_file(file)
     extractor = InvoiceExtractor()
-    extracted = extractor.extract(original_path, file.content_type, project)
+    extracted = extractor.extract(processing_path, file.content_type, project)
     status = "needs_review" if extracted.confidence < 0.85 else "reviewed"
 
     invoice = Invoice(
@@ -123,7 +123,7 @@ def upload_invoice(
         extraction_confidence=extracted.confidence,
         original_filename=file.filename or stored_filename,
         stored_filename=stored_filename,
-        original_path=original_path,
+        original_path=processing_path,
         status=status,
     )
     db.add(invoice)

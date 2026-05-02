@@ -40,7 +40,7 @@ def generate_invoice_pdf(invoice, output_path: str | Path) -> None:
 
     pdf.setTitle(f"Invoice {invoice.invoice_number or invoice.id}")
     pdf.setFont("Helvetica-Bold", 18)
-    pdf.drawString(0.7 * inch, height - 0.7 * inch, "Original invoice image")
+    pdf.drawString(0.7 * inch, height - 0.7 * inch, "Corrected invoice image")
     pdf.setFont("Helvetica", 10)
     pdf.drawString(0.7 * inch, height - 0.95 * inch, invoice.original_filename or "Uploaded invoice")
 
@@ -72,7 +72,7 @@ def generate_invoice_pdf(invoice, output_path: str | Path) -> None:
         y = height - 1.6 * inch
         y = _draw_wrapped_text(
             pdf,
-            "The original upload is stored with this invoice, but it could not be rendered as an image in the PDF preview.",
+            "The corrected invoice image is stored with this invoice, but it could not be rendered in the PDF preview.",
             0.7 * inch,
             y,
         )
