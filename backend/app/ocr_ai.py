@@ -97,40 +97,12 @@ class InvoiceExtractor:
     def close_money(self, left: float, right: float) -> bool:
         return abs(left - right) <= max(0.05, abs(right) * 0.01)
 
-    def _trailing_qty_before_first_money(self, line: str, money_values):
-        if len(money_values) < 2:
-            return None
-
-        first_money = money_values[0]
-        before_first_money = line[: first_money.start()]
-        qty_match = re.search(r"(?<![A-Za-z])(\d{1,4})(?:[,.]0+)?\s*$", before_first_money)
-
-        if not qty_match:
-            return None
-
-        qty = self.parse_number(qty_match.group(1))
-        price = self.parse_number(money_values[0].group(0))
-        total = self.parse_number(money_values[1].group(0))
-
-        if qty <= 0 or price <= 0 or total <= 0:
-            return None
-
-        if not self.close_money(qty * price, total):
-            return None
-
-        return qty, qty_match
-
     def column_numbers(self, line: str) -> list[float]:
         money_values = self.money_matches(line)
         numbers = [self.parse_number(match.group(0)) for match in money_values]
 
         if len(numbers) >= 4:
             return numbers[-4:]
-
-        qty_before_money = self._trailing_qty_before_first_money(line, money_values)
-        if qty_before_money:
-            qty, _ = qty_before_money
-            return [qty, *numbers]
 
         return numbers
 
@@ -142,18 +114,6 @@ class InvoiceExtractor:
 
         first_money_index = money_values[0].start()
         description = line[:first_money_index].strip()
-
-        qty_before_money = self._trailing_qty_before_first_money(line, money_values)
-        if qty_before_money:
-            _, qty_match = qty_before_money
-            description = description[: qty_match.start()].strip()
-        else:
-            numbers = self.column_numbers(line)
-            if len(numbers) == 2 and numbers[0] > 0 and numbers[1] >= numbers[0]:
-                inferred_qty = numbers[1] / numbers[0]
-                if abs(inferred_qty - round(inferred_qty)) < 0.001:
-                    qty_text = str(int(round(inferred_qty)))
-                    description = re.sub(rf"^\s*{re.escape(qty_text)}(?:[,.]0+)?\s+", "", description)
 
         description = re.sub(r"\s{2,}", " ", description)
         description = re.sub(r"[\s|:;-]+$", "", description).strip()
@@ -176,17 +136,14 @@ class InvoiceExtractor:
         if len(money_values) < 2:
             return False
 
-        after_last_money = line[money_values[-1].end() :]
-        after_last_money = re.sub(r"\b(?:eur|usd|gbp)\b|[€$£]", "", after_last_money, flags=re.IGNORECASE)
-        if re.search(r"[A-Za-z0-9]", after_last_money):
-            return False
-
         description = self.clean_item_description(line)
         letters = re.sub(r"[^A-Za-z]", "", description)
+
         if len(letters) < 2:
             return False
 
         qty, price, total, _ = self.extract_price_qty_total(line)
+
         return qty > 0 and price > 0 and total > 0
 
     def extract_price_qty_total(self, line: str) -> tuple[float, float, float, float]:
@@ -196,9 +153,6 @@ class InvoiceExtractor:
         confidence = 0.5
 
         numbers = self.column_numbers(line)
-
-        def is_wholeish(value: float) -> bool:
-            return abs(value - round(value)) < 0.001
 
         # Qty | Unit Price | Total excl VAT | RRP
         if len(numbers) >= 4:
@@ -226,18 +180,14 @@ class InvoiceExtractor:
         if len(numbers) == 2:
             first, second = numbers
 
-            if first > 0 and second >= first and is_wholeish(second / first):
+            if first > 0 and second >= first:
                 price = first
                 total = second
                 qty = round(total / price, 2)
-            elif is_wholeish(first) and first <= 100:
+            else:
                 qty = first
                 price = second
                 total = round(qty * price, 2)
-            else:
-                price = first
-                total = second
-                qty = round(total / price, 2) if price > 0 else 1.0
 
             confidence = 0.7
             return round(qty, 2), round(price, 2), round(total, 2), confidence
@@ -250,32 +200,43 @@ class InvoiceExtractor:
         if "cable clip" in lower or "c/clip" in lower:
             return "Electrical"
 
-        plumbing_words = [
-            "pipe", "pipes", "elbow", "bend", "valve", "drain",
-            "trap", "waste", "ppr", "pvc", "copper", "fitting"
-        ]
-
-        electrical_words = [
-            "conduit", "cable", "socket", "switch", "terminal", "connector"
-        ]
-
-        fixing_words = [
-            "screw", "bolt", "nut", "washer", "clip", "plug"
-        ]
-
-        if any(word in lower for word in plumbing_words):
+        if any(word in lower for word in ["pipe", "drain", "pvc", "fitting"]):
             return "Plumbing"
 
-        if any(word in lower for word in electrical_words):
+        if any(word in lower for word in ["cable", "socket", "switch"]):
             return "Electrical"
 
-        if any(word in lower for word in fixing_words):
+        if any(word in lower for word in ["screw", "bolt", "clip"]):
             return "Fixings"
 
         return "Unknown"
 
     def extract_structured_data(self, raw_text: str) -> ExtractedInvoice:
         cleaned_lines = self.clean_lines(raw_text)
+
+        # --- Metadata extraction ---
+        invoice_number = None
+        date = None
+        total = None
+
+        for line in cleaned_lines:
+            lower = line.lower()
+
+            if "invoice number" in lower:
+                match = re.search(r"inv[\w\d]+", line, re.IGNORECASE)
+                if match:
+                    invoice_number = match.group(0)
+
+            if "invoice date" in lower:
+                match = re.search(r"\d{2}/\d{2}/\d{4}", line)
+                if match:
+                    date = match.group(0)
+
+            if "grand total" in lower:
+                nums = self.money_matches(line)
+                if nums:
+                    total = self.parse_number(nums[-1].group(0))
+
         line_items = []
 
         for line in cleaned_lines:
@@ -283,7 +244,7 @@ class InvoiceExtractor:
                 continue
 
             description = self.clean_item_description(line)
-            qty, price, total, confidence = self.extract_price_qty_total(line)
+            qty, price, item_total, confidence = self.extract_price_qty_total(line)
             category = self.guess_category(description)
 
             line_items.append(
@@ -291,20 +252,19 @@ class InvoiceExtractor:
                     item=description,
                     qty=qty,
                     price=price,
-                    total=total,
+                    total=item_total,
                     category=category,
                     confidence=confidence,
                 )
             )
 
         supplier = cleaned_lines[0] if cleaned_lines else "Unknown"
-        invoice_total = round(sum(item.total for item in line_items), 2) if line_items else None
 
         return ExtractedInvoice(
             supplier=supplier,
-            invoice_number=None,
-            date=None,
-            total=invoice_total,
+            invoice_number=invoice_number,
+            date=date,
+            total=total,
             line_items=line_items,
         )
 
