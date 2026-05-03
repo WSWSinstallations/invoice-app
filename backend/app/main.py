@@ -80,7 +80,7 @@ def invoice_to_dict(invoice: Invoice) -> dict:
 
 
 def regenerate_outputs(db: Session, invoice: Invoice) -> Invoice:
-    line_items_total = round(sum(item.total for item in invoice.line_items), 2)
+    line_items_total = round(sum(_float_or_default(item.total) for item in invoice.line_items), 2)
 
     if not invoice.total_amount or invoice.total_amount <= 0:
         invoice.total_amount = line_items_total
