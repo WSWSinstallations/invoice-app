@@ -47,6 +47,7 @@ def get_invoice_or_404(db: Session, invoice_id: int) -> Invoice:
 
 
 def line_item_to_dict(line_item: LineItem) -> dict:
+    confidence = _bounded_confidence(line_item.confidence, default=0.0)
     return {
         "id": line_item.id,
         "item": line_item.item,
@@ -54,8 +55,8 @@ def line_item_to_dict(line_item: LineItem) -> dict:
         "price": line_item.price,
         "total": line_item.total,
         "category": line_item.category,
-        "confidence": line_item.confidence,
-        "low_confidence": line_item.confidence < 0.75,
+        "confidence": confidence,
+        "low_confidence": confidence < 0.75,
     }
 
 
@@ -96,6 +97,33 @@ def regenerate_outputs(db: Session, invoice: Invoice) -> Invoice:
     return get_invoice_or_404(db, invoice.id)
 
 
+def _float_or_default(value, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_confidence(value, default: float = 1.0) -> float:
+    confidence = _float_or_default(value, default)
+    return max(0.0, min(1.0, confidence))
+
+
+def _line_item_total(qty: float, price: float, total) -> float:
+    if total is not None:
+        return round(_float_or_default(total), 2)
+    return round(qty * price, 2)
+
+
+def _average_line_confidence(line_items: list) -> float:
+    if not line_items:
+        return 0.0
+    confidences = [_bounded_confidence(getattr(item, "confidence", 0.0), default=0.0) for item in line_items]
+    return round(sum(confidences) / len(confidences), 2)
+
+
 @app.get("/")
 def root() -> dict:
     return {"status": "ok", "service": "invoice-processing-api"}
@@ -107,14 +135,11 @@ def health() -> dict:
 
 
 @app.post("/api/invoices/upload")
-async def upload_invoice(file: UploadFile, project: str = "General"):
-    from app.storage import save_upload_file
-    from app.ocr_ai import InvoiceExtractor
-    from app.database import SessionLocal
-    from app.models import Invoice
-
-    db = SessionLocal()
-
+async def upload_invoice(
+    file: UploadFile = File(...),
+    project: str = Form("General"),
+    db: Session = Depends(get_db),
+):
     try:
         print("UPLOAD HIT")
 
@@ -122,37 +147,72 @@ async def upload_invoice(file: UploadFile, project: str = "General"):
         print("PROCESSING PATH:", processing_path)
 
         extractor = InvoiceExtractor()
-        extracted = extractor.extract(processing_path, file.content_type, project)
+        try:
+            extracted = extractor.extract(processing_path, file.content_type, project)
+        except Exception as error:
+            print("EXTRACTION ERROR:", str(error))
+            extracted = None
 
-        # SAFE values (avoid crashes)
-        supplier = getattr(extracted, "supplier", "Unknown")
-        date = getattr(extracted, "date", None)
-        total = getattr(extracted, "total", 0.0)
+        extracted_line_items = list(getattr(extracted, "line_items", []) or [])
+        project_name = (project or "General").strip() or "General"
 
         invoice = Invoice(
-            filename=stored_filename,
-            supplier=supplier,
-            project=project,
-            date=date,
-            total=total
+            supplier=getattr(extracted, "supplier", None) or "Unknown",
+            invoice_number=getattr(extracted, "invoice_number", None) or "",
+            invoice_date=getattr(extracted, "date", None) or "",
+            project=project_name,
+            currency=os.getenv("DEFAULT_CURRENCY", "EUR"),
+            total_amount=_float_or_default(getattr(extracted, "total", None)),
+            extraction_confidence=_average_line_confidence(extracted_line_items),
+            original_filename=file.filename or stored_filename,
+            stored_filename=stored_filename,
+            original_path=processing_path,
+            status="needs_review",
         )
 
         db.add(invoice)
-        db.commit()
-        db.refresh(invoice)
+        db.flush()
 
-        return {
-            "id": invoice.id,
-            "supplier": supplier,
-            "project": project,
-            "date": date,
-            "total": total,
-            "line_items": [item.item for item in extracted.line_items] if extracted.line_items else []
-        }
+        for item in extracted_line_items:
+            qty = _float_or_default(getattr(item, "qty", None), 1.0)
+            price = _float_or_default(getattr(item, "price", None))
+            total = _line_item_total(qty, price, getattr(item, "total", None))
+            db.add(
+                LineItem(
+                    invoice_id=invoice.id,
+                    item=getattr(item, "item", "") or "",
+                    qty=round(qty, 2),
+                    price=round(price, 2),
+                    total=total,
+                    category=getattr(item, "category", None) or "Uncategorized",
+                    confidence=_bounded_confidence(getattr(item, "confidence", None)),
+                )
+            )
+
+        if not invoice.total_amount or invoice.total_amount <= 0:
+            invoice.total_amount = round(sum(_line_item_total(
+                _float_or_default(getattr(item, "qty", None), 1.0),
+                _float_or_default(getattr(item, "price", None)),
+                getattr(item, "total", None),
+            ) for item in extracted_line_items), 2)
+
+        db.commit()
+        invoice = get_invoice_or_404(db, invoice.id)
+
+        invoice_id = invoice.id
+        try:
+            invoice = regenerate_outputs(db, invoice)
+        except Exception as error:
+            print("OUTPUT GENERATION ERROR:", str(error))
+            db.rollback()
+            invoice = get_invoice_or_404(db, invoice_id)
+
+        return invoice_to_dict(invoice)
 
     except Exception as e:
+        db.rollback()
         print("UPLOAD ERROR:", str(e))
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail="Invoice upload failed. Please try again.")
 
 
 @app.get("/api/invoices")
