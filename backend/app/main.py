@@ -164,7 +164,6 @@ def list_invoices(db: Session = Depends(get_db)) -> list[dict]:
     return [invoice_to_dict(invoice) for invoice in invoices]
 
 
-# ✅ DELETE ENDPOINT ADDED HERE
 @app.delete("/api/invoices/{invoice_id}")
 def delete_invoice(invoice_id: int, db: Session = Depends(get_db)) -> dict:
     invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
