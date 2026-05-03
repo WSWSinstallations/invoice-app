@@ -115,7 +115,7 @@ def upload_invoice(
     stored_filename, processing_path = save_upload_file(file)
     extractor = InvoiceExtractor()
     extracted = extractor.extract(processing_path, file.content_type, project)
-    status = "needs_review" if extracted.confidence < 0.85 else "reviewed"
+    status = "reviewed"
 
     invoice = Invoice(
         supplier=extracted.supplier,
