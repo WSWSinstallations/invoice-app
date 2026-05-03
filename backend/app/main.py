@@ -158,6 +158,32 @@ def list_invoices(db: Session = Depends(get_db)) -> list[dict]:
     )
     return [invoice_to_dict(invoice) for invoice in invoices]
 
+@app.delete("/api/invoices/{invoice_id}")
+def delete_invoice(invoice_id: int, db: Session = Depends(get_db)) -> dict:
+    invoice = get_invoice_or_404(db, invoice_id)
+
+    files_to_delete = [
+        invoice.pdf_path,
+        invoice.excel_path,
+        invoice.original_path,
+    ]
+
+    for file_path in files_to_delete:
+        if not file_path:
+            continue
+
+        try:
+            resolved = resolve_path(file_path)
+            if resolved.exists() and resolved.is_file():
+                resolved.unlink()
+        except Exception as error:
+            print(f"Could not delete file {file_path}: {error}")
+
+    db.delete(invoice)
+    db.commit()
+
+    return {"success": True, "deleted_invoice_id": invoice_id}
+
 
 @app.get("/api/invoices/{invoice_id}")
 def get_invoice(invoice_id: int, db: Session = Depends(get_db)) -> dict:
