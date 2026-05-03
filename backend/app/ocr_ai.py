@@ -289,138 +289,170 @@ class InvoiceExtractor:
         return 0.0
 
     def guess_category(self, text: str) -> str:
-        lower = text.lower()
+    lower = text.lower()
 
-        plumbing_words = [
-            "pipe",
-            "pipes",
-            "elbow",
-            "bend",
-            "valve",
-            "drain",
-            "trap",
-            "waste",
-            "ppr",
-            "pvc",
-            "copper",
-            "fitting",
-            "fittings",
-            "bush",
-            "reducer",
-            "hopper",
-            "floor drain",
-            "easybend",
-        ]
+    # Specific overrides first
+    if "cable clip" in lower or "c/clip" in lower:
+        return "Electrical"
 
-        electrical_words = [
-            "conduit",
-            "cable",
-            "cables",
-            "socket",
-            "switch",
-            "breaker",
-            "mcb",
-            "rcd",
-            "terminal",
-            "terminal box",
-            "tee box",
-            "u box",
-            "trunking",
-            "db",
-            "connector",
-            "connectors",
-            "wiring",
-        ]
+    plumbing_words = [
+        "pipe",
+        "pipes",
+        "elbow",
+        "bend",
+        "valve",
+        "drain",
+        "trap",
+        "waste",
+        "ppr",
+        "pvc",
+        "copper",
+        "fitting",
+        "fittings",
+        "bush",
+        "reducer",
+        "hopper",
+        "floor drain",
+        "easybend",
+    ]
 
-        fixing_words = [
-            "screw",
-            "screws",
-            "bolt",
-            "nut",
-            "washer",
-            "clip",
-            "plug",
-            "anchor",
-            "fixing",
-            "galvanised",
-        ]
+    electrical_words = [
+        "conduit",
+        "cable",
+        "cables",
+        "socket",
+        "switch",
+        "breaker",
+        "mcb",
+        "rcd",
+        "terminal",
+        "terminal box",
+        "tee box",
+        "u box",
+        "trunking",
+        "db",
+        "connector",
+        "connectors",
+        "wiring",
+    ]
 
-        if any(word in lower for word in plumbing_words):
-            return "Plumbing"
+    fixing_words = [
+        "screw",
+        "screws",
+        "bolt",
+        "nut",
+        "washer",
+        "clip",
+        "plug",
+        "anchor",
+        "fixing",
+        "galvanised",
+    ]
 
-        if any(word in lower for word in electrical_words):
-            return "Electrical"
+    if any(word in lower for word in plumbing_words):
+        return "Plumbing"
 
-        if any(word in lower for word in fixing_words):
-            return "Fixings"
+    if any(word in lower for word in electrical_words):
+        return "Electrical"
 
-        return "Unknown"
+    if any(word in lower for word in fixing_words):
+        return "Fixings"
 
-    def looks_like_item(self, line: str) -> bool:
-        if self.is_admin_line(line):
-            return False
-
-        if not re.search(r"[A-Za-z]", line):
-            return False
-
-        category = self.guess_category(line)
-        money_values = self.money_matches(line)
-
-        # Strong signal: item keyword + price-looking numbers.
-        if category != "Unknown" and money_values:
-            return True
-
-        # Medium signal: item keyword even without readable prices.
-        if category != "Unknown":
-            return True
-
-        # Fallback: row has letters and at least two money-looking numbers.
-        if len(money_values) >= 2:
-            return True
-
-        return False
+    return "Unknown"
 
     def clean_item_description(self, line: str) -> str:
-        money_values = self.money_matches(line)
+    money_values = self.money_matches(line)
 
-        if not money_values:
-            return line.strip()
+    if not money_values:
+        return line.strip()
 
-        first_money_index = money_values[0].start()
-        description = line[:first_money_index].strip()
+    first_money_index = money_values[0].start()
+    description = line[:first_money_index].strip()
 
-        # Remove a trailing standalone quantity, but avoid removing sizes like 20mm.
-        description = re.sub(r"\s+(?<![A-Za-z])\d+(?:[.,]\d+)?\s*$", "", description).strip()
+    # Keep pack information like "pkt. of 1" or "pkt. of 100".
+    # Do not remove trailing numbers because they may be part of the product description.
+    description = re.sub(r"\s{2,}", " ", description).strip()
 
-        return description or line.strip()
+    return description or line.strip()
 
     def extract_price_qty_total(self, line: str) -> tuple[float, float, float, float]:
-        qty = 1.0
-        price = 0.0
-        total = 0.0
-        confidence = 0.5
+    qty = 1.0
+    price = 0.0
+    total = 0.0
+    confidence = 0.5
 
-        money_values = self.money_matches(line)
+    money_values = [self.parse_number(match.group(0)) for match in self.money_matches(line)]
 
-        if len(money_values) >= 2:
-            price = self.parse_number(money_values[-2].group(0))
-            total = self.parse_number(money_values[-1].group(0))
-            confidence = 0.75
+    def is_wholeish(value: float) -> bool:
+        return abs(value - round(value)) < 0.001
 
-            before_price = line[: money_values[-2].start()]
-            possible_qtys = self.standalone_numbers_before(before_price)
+    # Master Enterprise layout:
+    # Quantity | Unit Price | Total excl VAT | RRP
+    # Example:
+    # 3.00 3.91 11.73 5.26
+    # 1.00 2.76 2.76 3.73
+    if len(money_values) >= 4:
+        qty = money_values[-4]
+        price = money_values[-3]
+        total = money_values[-2]
+        confidence = 0.9
+        return round(qty, 2), round(price, 2), round(total, 2), confidence
 
-            if possible_qtys:
-                qty = self.parse_number(possible_qtys[-1])
+    # Sometimes OCR misses the quantity but reads:
+    # Unit Price | Total excl VAT | RRP
+    # Example:
+    # 2.76 2.76 3.73
+    if len(money_values) == 3:
+        first, second, third = money_values
 
-            return qty, price, total, confidence
+        # If the third value matches first * second, treat as Qty | Unit | Total.
+        if abs((first * second) - third) < 0.05:
+            qty = first
+            price = second
+            total = third
+        else:
+            # Otherwise treat as Unit | Total | RRP and ignore RRP.
+            price = first
+            total = second
 
-        if len(money_values) == 1:
-            total = self.parse_number(money_values[-1].group(0))
-            confidence = 0.6
-            return qty, price, total, confidence
+            if price > 0:
+                qty = round(total / price, 2)
+            else:
+                qty = 1.0
 
-        return qty, price, total, confidence
+        confidence = 0.85
+        return round(qty, 2), round(price, 2), round(total, 2), confidence
+
+    # Sometimes OCR reads only:
+    # Quantity | Unit Price
+    # Example:
+    # 3.00 3.91
+    # In that case calculate the line total.
+    if len(money_values) == 2:
+        first, second = money_values
+
+        if is_wholeish(first) and first <= 100:
+            qty = first
+            price = second
+            total = round(qty * price, 2)
+        else:
+            price = first
+            total = second
+
+            if price > 0:
+                qty = round(total / price, 2)
+            else:
+                qty = 1.0
+
+        confidence = 0.75
+        return round(qty, 2), round(price, 2), round(total, 2), confidence
+
+    if len(money_values) == 1:
+        total = money_values[0]
+        confidence = 0.55
+        return qty, price, round(total, 2), confidence
+
+    return qty, price, total, confidence
 
     def extract_line_items(self, lines: list[str]) -> list[ExtractedLineItem]:
         line_items = []
