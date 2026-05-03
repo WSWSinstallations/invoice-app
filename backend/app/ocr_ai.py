@@ -150,41 +150,82 @@ class InvoiceExtractor:
         return "Unknown"
 
     def extract_structured_data(self, raw_text: str) -> ExtractedInvoice:
-        lines = raw_text.split("\n")
+    lines = raw_text.split("\n")
 
-        cleaned_lines = []
-        for line in lines:
-            line = line.strip()
-            if len(line) > 5:
-                cleaned_lines.append(line)
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        if len(line) > 5:
+            cleaned_lines.append(line)
 
-        line_items = []
+    def is_line_item(line: str) -> bool:
+        lower = line.lower()
 
-        for line in cleaned_lines:
-            description = self.clean_item_description(line)
-            qty, price, total, confidence = self.extract_price_qty_total(line)
-            category = self.guess_category(description)
+        # Skip headers / junk
+        blacklist = [
+            "invoice",
+            "date",
+            "total",
+            "vat",
+            "client",
+            "tel",
+            "mob",
+            "email",
+            "address",
+            "reg",
+            "number",
+            "amount",
+            "discount",
+        ]
 
-            line_items.append(
-                ExtractedLineItem(
-                    item=description,
-                    qty=qty,
-                    price=price,
-                    total=total,
-                    category=category,
-                    confidence=confidence,
-                )
+        if any(word in lower for word in blacklist):
+            return False
+
+        # Must contain at least 2 numeric values
+        numbers = self.money_matches(line)
+        if len(numbers) < 2:
+            return False
+
+        # Must have some letters (actual description)
+        if not re.search(r"[a-zA-Z]", line):
+            return False
+
+        return True
+
+    line_items = []
+
+    for line in cleaned_lines:
+        if not is_line_item(line):
+            continue
+
+        description = self.clean_item_description(line)
+        qty, price, total, confidence = self.extract_price_qty_total(line)
+        category = self.guess_category(description)
+
+        # Skip garbage rows
+        if total == 0 and price == 0:
+            continue
+
+        line_items.append(
+            ExtractedLineItem(
+                item=description,
+                qty=qty,
+                price=price,
+                total=total,
+                category=category,
+                confidence=confidence,
             )
-
-        supplier = cleaned_lines[0] if cleaned_lines else "Unknown"
-
-        return ExtractedInvoice(
-            supplier=supplier,
-            invoice_number=None,
-            date=None,
-            total=None,
-            line_items=line_items,
         )
+
+    supplier = cleaned_lines[0] if cleaned_lines else "Unknown"
+
+    return ExtractedInvoice(
+        supplier=supplier,
+        invoice_number=None,
+        date=None,
+        total=None,
+        line_items=line_items,
+    )
 
     def extract(self, file_path: str, content_type: str | None, project: str):
         raw_text = self.extract_text(file_path, content_type)
