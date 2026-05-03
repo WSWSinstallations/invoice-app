@@ -1,9 +1,17 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 import re
 
 import pytesseract
 from PIL import Image, ImageOps
+
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception as error:
+    print(f"HEIC support not available in OCR module: {error}")
 
 
 @dataclass
@@ -34,6 +42,9 @@ class InvoiceExtractor:
 
     def extract_text(self, file_path: str, content_type: str | None) -> str:
         try:
+            print(f"OCR FILE PATH: {file_path}")
+            print(f"OCR CONTENT TYPE: {content_type}")
+
             if content_type and "pdf" in content_type.lower():
                 print("OCR FAILED: PDF uploads are not supported yet.")
                 return ""
@@ -41,10 +52,20 @@ class InvoiceExtractor:
             image = Image.open(file_path)
             image = ImageOps.exif_transpose(image)
 
+            if image.width > image.height:
+                image = image.rotate(90, expand=True)
+
             if image.mode not in {"RGB", "L"}:
                 image = image.convert("RGB")
 
+            print(f"OCR IMAGE SIZE: {image.size}")
+            print(f"OCR IMAGE MODE: {image.mode}")
+
             text = pytesseract.image_to_string(image)
+
+            if not text or len(text.strip()) < 10:
+                print("OCR TEXT SHORT - RETRYING WITH PSM 6")
+                text = pytesseract.image_to_string(image, config="--psm 6")
 
             print("OCR TEXT START ----------------")
             print(text)
@@ -71,11 +92,10 @@ class InvoiceExtractor:
         if not lines:
             return "Unknown supplier"
 
-        # Usually supplier is near the top of an invoice.
-        for line in lines[:8]:
+        for line in lines[:10]:
             lower = line.lower()
 
-            if any(word in lower for word in ["invoice", "date", "vat", "tel", "email", "page"]):
+            if any(word in lower for word in ["invoice", "date", "vat", "tel", "email", "page", "total"]):
                 continue
 
             if len(line) >= 5:
@@ -108,23 +128,25 @@ class InvoiceExtractor:
         for line in lines:
             for pattern in date_patterns:
                 match = re.search(pattern, line)
-                if match:
-                    value = match.group(1)
 
-                    # Convert common formats to YYYY-MM-DD where possible.
-                    if "/" in value:
-                        day, month, year = value.split("/")
-                        return f"{year}-{month}-{day}"
+                if not match:
+                    continue
 
-                    if "." in value:
-                        day, month, year = value.split(".")
-                        return f"{year}-{month}-{day}"
+                value = match.group(1)
 
-                    if "-" in value and value[2] == "-":
-                        day, month, year = value.split("-")
-                        return f"{year}-{month}-{day}"
+                if "/" in value:
+                    day, month, year = value.split("/")
+                    return f"{year}-{month}-{day}"
 
-                    return value
+                if "." in value:
+                    day, month, year = value.split(".")
+                    return f"{year}-{month}-{day}"
+
+                if "-" in value and value[2] == "-":
+                    day, month, year = value.split("-")
+                    return f"{year}-{month}-{day}"
+
+                return value
 
         return ""
 
@@ -265,6 +287,7 @@ class InvoiceExtractor:
                 price = self.parse_number(numbers[-2])
                 total = self.parse_number(numbers[-1])
                 confidence = 0.6
+
             elif len(numbers) == 2:
                 price = self.parse_number(numbers[-2])
                 total = self.parse_number(numbers[-1])
