@@ -88,32 +88,120 @@ class InvoiceExtractor:
 
         return lines
 
+    def is_admin_line(self, line: str) -> bool:
+        lower = line.lower()
+
+        admin_words = [
+            "master enterprise company",
+            "ammonry",
+            "malta",
+            "for all kinds of",
+            "electrical cables & wiring accessories",
+            "water drain pipes",
+            "v.a.t",
+            "vat",
+            "reg no",
+            "reg. no",
+            "exemption",
+            "tel",
+            "email",
+            "@",
+            "invoice",
+            "receipt",
+            "date",
+            "page",
+            "address",
+            "customer",
+            "supplier",
+            "company limited",
+            "limited",
+            "subtotal",
+            "sub total",
+            "grand total",
+            "total due",
+            "amount due",
+            "balance due",
+            "payment",
+            "terms",
+            "description",
+            "quantity",
+            "unit price",
+            "price total",
+        ]
+
+        return any(word in lower for word in admin_words)
+
     def guess_supplier(self, lines: list[str]) -> str:
         if not lines:
             return "Unknown supplier"
 
+        for line in lines[:12]:
+            lower = line.lower()
+
+            if "master enterprise" in lower:
+                return "Master Enterprise Company Limited"
+
         for line in lines[:10]:
             lower = line.lower()
 
-            if any(word in lower for word in ["invoice", "date", "vat", "tel", "email", "page", "total"]):
-                continue
+            if self.is_admin_line(line):
+                if "master enterprise" not in lower:
+                    continue
 
             if len(line) >= 5:
                 return line
 
-        return lines[0]
+        return "Unknown supplier"
+
+    def valid_invoice_candidate(self, value: str) -> bool:
+        value = value.strip().strip(":").strip("-").strip()
+
+        if not value:
+            return False
+
+        banned = {
+            "date",
+            "invoice",
+            "number",
+            "no",
+            "page",
+            "vat",
+            "total",
+            "customer",
+            "supplier",
+        }
+
+        if value.lower() in banned:
+            return False
+
+        # Invoice numbers usually contain at least one digit.
+        return any(char.isdigit() for char in value)
 
     def guess_invoice_number(self, lines: list[str]) -> str:
-        patterns = [
-            r"(?:invoice|inv|doc|receipt)\s*(?:no|number|#)?\s*[:\-]?\s*([A-Z0-9\-\/]+)",
-            r"\bINV[-\s]?[A-Z0-9\-\/]+\b",
+        label_patterns = [
+            r"(?:invoice\s*(?:no|number|#)|inv\s*(?:no|number|#)|doc\s*(?:no|number|#)|receipt\s*(?:no|number|#))\s*[:\-]?\s*([A-Z0-9\-\/]+)",
+            r"\b(INV[-\s]?[A-Z0-9\-\/]+)\b",
         ]
 
         for line in lines:
-            for pattern in patterns:
+            for pattern in label_patterns:
                 match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    return match.group(1) if match.groups() else match.group(0)
+
+                if not match:
+                    continue
+
+                candidate = match.group(1).strip()
+
+                if self.valid_invoice_candidate(candidate):
+                    return candidate
+
+        # Fallback: look for any token that looks like a document number.
+        for line in lines[:20]:
+            tokens = re.findall(r"\b[A-Z]{0,4}\d{3,}[A-Z0-9\-\/]*\b", line.upper())
+
+            for token in tokens:
+                if self.valid_invoice_candidate(token):
+                    return token
 
         return ""
 
@@ -171,13 +259,25 @@ class InvoiceExtractor:
         except Exception:
             return 0.0
 
+    def money_matches(self, line: str):
+        return list(re.finditer(r"(?<![A-Za-z])\d{1,6}[.,]\d{2}(?![A-Za-z])", line))
+
+    def standalone_numbers_before(self, text: str) -> list[str]:
+        return re.findall(r"(?<![A-Za-z])\b\d+(?:[.,]\d+)?\b(?![A-Za-z])", text)
+
     def guess_total_amount(self, lines: list[str]) -> float:
         total_candidates = []
 
         for line in lines:
             lower = line.lower()
 
-            if any(word in lower for word in ["total", "amount due", "balance due", "grand total"]):
+            if any(word in lower for word in ["grand total", "total", "amount due", "balance due"]):
+                money_values = self.money_matches(line)
+
+                if money_values:
+                    total_candidates.append(self.parse_number(money_values[-1].group(0)))
+                    continue
+
                 numbers = re.findall(r"\d+(?:[.,]\d{1,2})?", line)
 
                 if numbers:
@@ -193,6 +293,7 @@ class InvoiceExtractor:
 
         plumbing_words = [
             "pipe",
+            "pipes",
             "elbow",
             "bend",
             "valve",
@@ -203,28 +304,37 @@ class InvoiceExtractor:
             "pvc",
             "copper",
             "fitting",
+            "fittings",
             "bush",
             "reducer",
             "hopper",
+            "floor drain",
+            "easybend",
         ]
 
         electrical_words = [
             "conduit",
             "cable",
+            "cables",
             "socket",
             "switch",
             "breaker",
             "mcb",
             "rcd",
             "terminal",
-            "box",
+            "terminal box",
+            "tee box",
+            "u box",
             "trunking",
             "db",
             "connector",
+            "connectors",
+            "wiring",
         ]
 
         fixing_words = [
             "screw",
+            "screws",
             "bolt",
             "nut",
             "washer",
@@ -232,6 +342,7 @@ class InvoiceExtractor:
             "plug",
             "anchor",
             "fixing",
+            "galvanised",
         ]
 
         if any(word in lower for word in plumbing_words):
@@ -245,61 +356,89 @@ class InvoiceExtractor:
 
         return "Unknown"
 
+    def looks_like_item(self, line: str) -> bool:
+        if self.is_admin_line(line):
+            return False
+
+        if not re.search(r"[A-Za-z]", line):
+            return False
+
+        category = self.guess_category(line)
+        money_values = self.money_matches(line)
+
+        # Strong signal: item keyword + price-looking numbers.
+        if category != "Unknown" and money_values:
+            return True
+
+        # Medium signal: item keyword even without readable prices.
+        if category != "Unknown":
+            return True
+
+        # Fallback: row has letters and at least two money-looking numbers.
+        if len(money_values) >= 2:
+            return True
+
+        return False
+
+    def clean_item_description(self, line: str) -> str:
+        money_values = self.money_matches(line)
+
+        if not money_values:
+            return line.strip()
+
+        first_money_index = money_values[0].start()
+        description = line[:first_money_index].strip()
+
+        # Remove a trailing standalone quantity, but avoid removing sizes like 20mm.
+        description = re.sub(r"\s+(?<![A-Za-z])\d+(?:[.,]\d+)?\s*$", "", description).strip()
+
+        return description or line.strip()
+
+    def extract_price_qty_total(self, line: str) -> tuple[float, float, float, float]:
+        qty = 1.0
+        price = 0.0
+        total = 0.0
+        confidence = 0.5
+
+        money_values = self.money_matches(line)
+
+        if len(money_values) >= 2:
+            price = self.parse_number(money_values[-2].group(0))
+            total = self.parse_number(money_values[-1].group(0))
+            confidence = 0.75
+
+            before_price = line[: money_values[-2].start()]
+            possible_qtys = self.standalone_numbers_before(before_price)
+
+            if possible_qtys:
+                qty = self.parse_number(possible_qtys[-1])
+
+            return qty, price, total, confidence
+
+        if len(money_values) == 1:
+            total = self.parse_number(money_values[-1].group(0))
+            confidence = 0.6
+            return qty, price, total, confidence
+
+        return qty, price, total, confidence
+
     def extract_line_items(self, lines: list[str]) -> list[ExtractedLineItem]:
         line_items = []
 
-        skip_words = [
-            "invoice",
-            "receipt",
-            "date",
-            "subtotal",
-            "sub total",
-            "vat",
-            "tax",
-            "grand total",
-            "total due",
-            "amount due",
-            "tel",
-            "email",
-            "address",
-            "page",
-        ]
-
         for line in lines:
-            lower = line.lower()
-
-            if any(word in lower for word in skip_words):
+            if not self.looks_like_item(line):
                 continue
 
-            has_letters = bool(re.search(r"[A-Za-z]", line))
-            if not has_letters:
-                continue
-
-            numbers = re.findall(r"\d+(?:[.,]\d{1,2})?", line)
-
-            qty = 1.0
-            price = 0.0
-            total = 0.0
-            confidence = 0.45
-
-            if len(numbers) >= 3:
-                qty = self.parse_number(numbers[-3])
-                price = self.parse_number(numbers[-2])
-                total = self.parse_number(numbers[-1])
-                confidence = 0.6
-
-            elif len(numbers) == 2:
-                price = self.parse_number(numbers[-2])
-                total = self.parse_number(numbers[-1])
-                confidence = 0.5
+            description = self.clean_item_description(line)
+            qty, price, total, confidence = self.extract_price_qty_total(line)
 
             line_items.append(
                 ExtractedLineItem(
-                    item=line,
+                    item=description,
                     qty=qty,
                     price=price,
                     total=total,
-                    category=self.guess_category(line),
+                    category=self.guess_category(description),
                     confidence=confidence,
                 )
             )
@@ -307,12 +446,12 @@ class InvoiceExtractor:
         if not line_items:
             line_items.append(
                 ExtractedLineItem(
-                    item="OCR did not find readable line items - please review manually",
+                    item="OCR found text but no clear line items - please review manually",
                     qty=1,
                     price=0,
                     total=0,
                     category="Unknown",
-                    confidence=0.1,
+                    confidence=0.2,
                 )
             )
 
@@ -349,10 +488,12 @@ class InvoiceExtractor:
         total_amount = self.guess_total_amount(lines)
         line_items = self.extract_line_items(lines)
 
-        if total_amount <= 0:
-            total_amount = round(sum(item.total for item in line_items), 2)
+        calculated_total = round(sum(item.total for item in line_items), 2)
 
-        confidence = 0.55
+        if total_amount <= 0 and calculated_total > 0:
+            total_amount = calculated_total
+
+        confidence = 0.45
 
         if supplier and supplier != "Unknown supplier":
             confidence += 0.1
@@ -363,7 +504,10 @@ class InvoiceExtractor:
         if invoice_number:
             confidence += 0.1
 
-        if line_items:
+        if line_items and line_items[0].confidence > 0.2:
+            confidence += 0.15
+
+        if total_amount > 0:
             confidence += 0.1
 
         confidence = min(confidence, 0.85)
