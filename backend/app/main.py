@@ -107,49 +107,52 @@ def health() -> dict:
 
 
 @app.post("/api/invoices/upload")
-def upload_invoice(
-    file: UploadFile = File(...),
-    project: str = Form(default=""),
-    db: Session = Depends(get_db),
-) -> dict:
-    stored_filename, processing_path = save_upload_file(file)
-    extractor = InvoiceExtractor()
-    extracted = extractor.extract(processing_path, file.content_type, project)
-    status = "reviewed"
+async def upload_invoice(file: UploadFile, project: str = "General"):
+    from app.storage import save_upload_file
+    from app.ocr_ai import InvoiceExtractor
+    from app.database import SessionLocal
+    from app.models import Invoice
 
-    invoice = Invoice(
-        supplier=extracted.supplier,
-        invoice_number=extracted.invoice_number,
-        invoice_date=extracted.invoice_date,
-        project=extracted.project,
-        currency=extracted.currency,
-        total_amount=extracted.total_amount,
-        extraction_confidence=extracted.confidence,
-        original_filename=file.filename or stored_filename,
-        stored_filename=stored_filename,
-        original_path=processing_path,
-        status=status,
-    )
-    db.add(invoice)
-    db.flush()
+    db = SessionLocal()
 
-    for item in extracted.line_items:
-        db.add(
-            LineItem(
-                invoice_id=invoice.id,
-                item=item.item,
-                qty=item.qty,
-                price=item.price,
-                total=item.total,
-                category=item.category,
-                confidence=item.confidence,
-            )
+    try:
+        print("UPLOAD HIT")
+
+        stored_filename, processing_path = save_upload_file(file)
+        print("PROCESSING PATH:", processing_path)
+
+        extractor = InvoiceExtractor()
+        extracted = extractor.extract(processing_path, file.content_type, project)
+
+        # SAFE values (avoid crashes)
+        supplier = getattr(extracted, "supplier", "Unknown")
+        date = getattr(extracted, "date", None)
+        total = getattr(extracted, "total", 0.0)
+
+        invoice = Invoice(
+            filename=stored_filename,
+            supplier=supplier,
+            project=project,
+            date=date,
+            total=total
         )
 
-    db.commit()
-    invoice = get_invoice_or_404(db, invoice.id)
-    invoice = regenerate_outputs(db, invoice)
-    return invoice_to_dict(invoice)
+        db.add(invoice)
+        db.commit()
+        db.refresh(invoice)
+
+        return {
+            "id": invoice.id,
+            "supplier": supplier,
+            "project": project,
+            "date": date,
+            "total": total,
+            "line_items": [item.item for item in extracted.line_items] if extracted.line_items else []
+        }
+
+    except Exception as e:
+        print("UPLOAD ERROR:", str(e))
+        return {"error": str(e)}
 
 
 @app.get("/api/invoices")
