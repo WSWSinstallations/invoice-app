@@ -109,26 +109,23 @@ def upload_invoice(
     db: Session = Depends(get_db),
 ) -> dict:
     stored_filename, processing_path = save_upload_file(file)
-
     extractor = InvoiceExtractor()
     extracted = extractor.extract(processing_path, file.content_type, project)
-
-    status = "needs_review"
+    status = "needs_review" if extracted.confidence < 0.85 else "reviewed"
 
     invoice = Invoice(
         supplier=extracted.supplier,
         invoice_number=extracted.invoice_number,
         invoice_date=extracted.invoice_date,
-        project=project,
-        currency="EUR",
-        total_amount=0,
-        extraction_confidence=0.5,
+        project=extracted.project,
+        currency=extracted.currency,
+        total_amount=extracted.total_amount,
+        extraction_confidence=extracted.confidence,
         original_filename=file.filename or stored_filename,
         stored_filename=stored_filename,
         original_path=processing_path,
         status=status,
     )
-
     db.add(invoice)
     db.flush()
 
@@ -146,10 +143,8 @@ def upload_invoice(
         )
 
     db.commit()
-
     invoice = get_invoice_or_404(db, invoice.id)
     invoice = regenerate_outputs(db, invoice)
-
     return invoice_to_dict(invoice)
 
 
@@ -164,20 +159,171 @@ def list_invoices(db: Session = Depends(get_db)) -> list[dict]:
     return [invoice_to_dict(invoice) for invoice in invoices]
 
 
-@app.delete("/api/invoices/{invoice_id}")
-def delete_invoice(invoice_id: int, db: Session = Depends(get_db)) -> dict:
-    invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-
-    db.delete(invoice)
-    db.commit()
-
-    return {"success": True}
-
-
 @app.get("/api/invoices/{invoice_id}")
 def get_invoice(invoice_id: int, db: Session = Depends(get_db)) -> dict:
     invoice = get_invoice_or_404(db, invoice_id)
     return invoice_to_dict(invoice)
+
+
+@app.put("/api/invoices/{invoice_id}/review")
+def update_invoice(invoice_id: int, payload: InvoiceUpdate, db: Session = Depends(get_db)) -> dict:
+    invoice = get_invoice_or_404(db, invoice_id)
+    invoice.supplier = payload.supplier
+    invoice.invoice_number = payload.invoice_number
+    invoice.invoice_date = payload.invoice_date
+    invoice.project = payload.project
+    invoice.currency = payload.currency
+    invoice.status = payload.status or "reviewed"
+
+    db.query(LineItem).filter(LineItem.invoice_id == invoice.id).delete(synchronize_session=False)
+    for item in payload.line_items:
+        total = item.total if item.total is not None else round(item.qty * item.price, 2)
+        db.add(
+            LineItem(
+                invoice_id=invoice.id,
+                item=item.item,
+                qty=item.qty,
+                price=item.price,
+                total=round(total, 2),
+                category=item.category or "Uncategorized",
+                confidence=item.confidence,
+            )
+        )
+
+    db.commit()
+    invoice = get_invoice_or_404(db, invoice.id)
+    invoice = regenerate_outputs(db, invoice)
+    return invoice_to_dict(invoice)
+
+
+@app.get("/api/invoices/{invoice_id}/pdf")
+def download_pdf(invoice_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    invoice = get_invoice_or_404(db, invoice_id)
+    path = resolve_path(invoice.pdf_path)
+    if not invoice.pdf_path or not path.exists():
+        invoice = regenerate_outputs(db, invoice)
+        path = resolve_path(invoice.pdf_path)
+    filename = f"{safe_filename(invoice.invoice_number or 'invoice')}.pdf"
+    return FileResponse(path, media_type="application/pdf", filename=filename)
+
+
+@app.get("/api/invoices/{invoice_id}/excel")
+def download_excel(invoice_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    invoice = get_invoice_or_404(db, invoice_id)
+    path = resolve_path(invoice.excel_path)
+    if not invoice.excel_path or not path.exists():
+        invoice = regenerate_outputs(db, invoice)
+        path = resolve_path(invoice.excel_path)
+    filename = f"{safe_filename(invoice.invoice_number or 'invoice')}.xlsx"
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+
+def _money(value) -> float:
+    return round(float(value or 0), 2)
+
+
+def dashboard_total_spend(db: Session) -> dict:
+    total = db.query(func.coalesce(func.sum(LineItem.total), 0)).scalar()
+    return {"total_spend": _money(total)}
+
+
+def dashboard_spend_by_category(db: Session) -> list[dict]:
+    total_expr = func.coalesce(func.sum(LineItem.total), 0).label("total")
+    rows = (
+        db.query(LineItem.category, total_expr)
+        .group_by(LineItem.category)
+        .order_by(desc(total_expr))
+        .all()
+    )
+    return [{"category": category or "Uncategorized", "total": _money(total)} for category, total in rows]
+
+
+def dashboard_top_items(db: Session) -> list[dict]:
+    qty_expr = func.coalesce(func.sum(LineItem.qty), 0).label("qty")
+    total_expr = func.coalesce(func.sum(LineItem.total), 0).label("total")
+    rows = (
+        db.query(
+            LineItem.item,
+            qty_expr,
+            total_expr,
+        )
+        .group_by(LineItem.item)
+        .order_by(desc(total_expr))
+        .limit(10)
+        .all()
+    )
+    return [{"item": item or "Unknown", "qty": _money(qty), "total": _money(total)} for item, qty, total in rows]
+
+
+def dashboard_top_suppliers(db: Session) -> list[dict]:
+    count_expr = func.count(Invoice.id).label("invoice_count")
+    total_expr = func.coalesce(func.sum(LineItem.total), 0).label("total")
+    rows = (
+        db.query(
+            Invoice.supplier,
+            count_expr,
+            total_expr,
+        )
+        .join(LineItem, LineItem.invoice_id == Invoice.id)
+        .group_by(Invoice.supplier)
+        .order_by(desc(total_expr))
+        .limit(10)
+        .all()
+    )
+    return [
+        {"supplier": supplier or "Unknown", "invoice_count": int(count), "total": _money(total)}
+        for supplier, count, total in rows
+    ]
+
+
+def dashboard_monthly_spend(db: Session) -> list[dict]:
+    month_expr = func.substr(Invoice.invoice_date, 1, 7)
+    total_expr = func.coalesce(func.sum(LineItem.total), 0).label("total")
+    rows = (
+        db.query(month_expr.label("month"), total_expr)
+        .join(LineItem, LineItem.invoice_id == Invoice.id)
+        .group_by(month_expr)
+        .order_by(month_expr)
+        .all()
+    )
+    return [{"month": month or "Unknown", "total": _money(total)} for month, total in rows]
+
+
+@app.get("/api/dashboard/total-spend")
+def total_spend(db: Session = Depends(get_db)) -> dict:
+    return dashboard_total_spend(db)
+
+
+@app.get("/api/dashboard/spend-by-category")
+def spend_by_category(db: Session = Depends(get_db)) -> list[dict]:
+    return dashboard_spend_by_category(db)
+
+
+@app.get("/api/dashboard/top-items")
+def top_items(db: Session = Depends(get_db)) -> list[dict]:
+    return dashboard_top_items(db)
+
+
+@app.get("/api/dashboard/top-suppliers")
+def top_suppliers(db: Session = Depends(get_db)) -> list[dict]:
+    return dashboard_top_suppliers(db)
+
+
+@app.get("/api/dashboard/monthly-spend")
+def monthly_spend(db: Session = Depends(get_db)) -> list[dict]:
+    return dashboard_monthly_spend(db)
+
+
+@app.get("/api/dashboard")
+def dashboard(db: Session = Depends(get_db)) -> dict:
+    return {
+        **dashboard_total_spend(db),
+        "spend_by_category": dashboard_spend_by_category(db),
+        "top_items": dashboard_top_items(db),
+        "top_suppliers": dashboard_top_suppliers(db),
+        "monthly_spend": dashboard_monthly_spend(db),
+    }
