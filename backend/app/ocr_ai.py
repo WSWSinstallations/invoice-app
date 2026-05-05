@@ -59,9 +59,10 @@ class InvoiceExtractor:
         first_money_index = money_values[0].start()
         description = line[:first_money_index].strip()
 
-        description = re.sub(r"\s{2,}", " ", description).strip()
+        description = re.sub(r"\s{2,}", " ", description)
+        description = re.sub(r"[\s|:;-]+$", "", description)
 
-        return description or line.strip()
+        return description.strip()
 
     def extract_price_qty_total(self, line: str) -> tuple[float, float, float, float]:
         qty = 1.0
@@ -117,6 +118,9 @@ class InvoiceExtractor:
             confidence = 0.55
             return qty, price, round(total, 2), confidence
 
+        if total == 0 and price > 0:
+            total = price
+
         return qty, price, total, confidence
 
     def guess_category(self, text: str) -> str:
@@ -151,17 +155,22 @@ class InvoiceExtractor:
         
     def looks_like_item(self, line: str) -> bool:
         money_values = self.money_matches(line)
-        
+
         if len(money_values) < 2:
             return False
-        
+
         lower = line.lower()
-        
+
         if any(keyword in lower for keyword in [
-        "invoice", "vat", "total", "tel", "mob", "email", "reg", "client"
+            "invoice", "vat", "total", "tel", "mob", "email",
+            "reg", "client", "date", "page", "address"
         ]):
             return False
-            
+
+        letters = re.sub(r"[^a-zA-Z]", "", line)
+        if len(letters) < 3:
+            return False
+
         return True
 
     def extract_structured_data(self, raw_text: str) -> ExtractedInvoice:
@@ -193,7 +202,16 @@ class InvoiceExtractor:
                 )
             )
 
-        supplier = cleaned_lines[0] if cleaned_lines else "Unknown"
+        supplier = "Unknown"
+
+        for line in cleaned_lines[:10]:
+            lower = line.lower()
+
+            if any(keyword in lower for keyword in [
+                "ltd", "limited", "company", "enterprise"
+            ]):
+                supplier = line
+                break
 
         invoice_number = None
         invoice_number_match = re.search(r"\bINV[\s-]*\d+\b", raw_text, re.IGNORECASE)
@@ -201,7 +219,11 @@ class InvoiceExtractor:
             invoice_number = re.sub(r"\s+", "", invoice_number_match.group(0)).upper()
 
         grand_total = None
-        grand_total_match = re.search(r"grand\s+total[^\d]*(\d+(?:\.\d{2}))", raw_text, re.IGNORECASE)
+        grand_total_match = re.search(
+            r"(grand\s+total|total\s+due)[^\d]*(\d+(?:\.\d{2}))",
+            raw_text,
+            re.IGNORECASE
+        )
         if grand_total_match:
             grand_total = self.parse_number(grand_total_match.group(1))
 
