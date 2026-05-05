@@ -153,7 +153,7 @@ class InvoiceExtractor:
         money_values = self.money_matches(line)
         
         if len(money_values) < 2:
-        return False
+            return False
         
         lower = line.lower()
         
